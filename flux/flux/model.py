@@ -5,6 +5,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from .layers import (
     DoubleStreamBlock,
@@ -85,6 +86,8 @@ class Flux(nn.Module):
     def sanitize(self, weights):
         new_weights = {}
         for k, w in weights.items():
+            if k.startswith("model.diffusion_model."):
+                k = k[22:]
             if k.endswith(".scale"):
                 k = k[:-6] + ".weight"
             for seq in ["img_mlp", "txt_mlp", "adaLN_modulation"]:
@@ -93,6 +96,47 @@ class Flux(nn.Module):
                     break
             new_weights[k] = w
         return new_weights
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        if N == 1:
+            return
+
+        for block in self.double_blocks:
+            block.num_heads //= N
+            block.img_attn.num_heads //= N
+            block.txt_attn.num_heads //= N
+            block.sharding_group = group
+            block.img_attn.qkv = shard_linear(
+                block.img_attn.qkv, "all-to-sharded", segments=3, group=group
+            )
+            block.txt_attn.qkv = shard_linear(
+                block.txt_attn.qkv, "all-to-sharded", segments=3, group=group
+            )
+            shard_inplace(block.img_attn.proj, "sharded-to-all", group=group)
+            shard_inplace(block.txt_attn.proj, "sharded-to-all", group=group)
+            block.img_mlp.layers[0] = shard_linear(
+                block.img_mlp.layers[0], "all-to-sharded", group=group
+            )
+            block.txt_mlp.layers[0] = shard_linear(
+                block.txt_mlp.layers[0], "all-to-sharded", group=group
+            )
+            shard_inplace(block.img_mlp.layers[2], "sharded-to-all", group=group)
+            shard_inplace(block.txt_mlp.layers[2], "sharded-to-all", group=group)
+
+        for block in self.single_blocks:
+            block.num_heads //= N
+            block.hidden_size //= N
+            block.linear1 = shard_linear(
+                block.linear1,
+                "all-to-sharded",
+                segments=[1 / 7, 2 / 7, 3 / 7],
+                group=group,
+            )
+            block.linear2 = shard_linear(
+                block.linear2, "sharded-to-all", segments=[1 / 5], group=group
+            )
 
     def __call__(
         self,
